@@ -157,7 +157,14 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent.resolve()
 
 def _secure_dir(path):
-    """Set directory to owner-only access (0700). No-op on Windows."""
+    """Set directory to owner-only access (0700). No-op on Windows.
+
+    Skipped in managed mode — the NixOS module sets group-readable
+    permissions (0750) so interactive users in the hermes group can
+    share state with the gateway service.
+    """
+    if is_managed():
+        return
     try:
         os.chmod(path, 0o700)
     except (OSError, NotImplementedError):
@@ -165,7 +172,13 @@ def _secure_dir(path):
 
 
 def _secure_file(path):
-    """Set file to owner-only read/write (0600). No-op on Windows."""
+    """Set file to owner-only read/write (0600). No-op on Windows.
+
+    Skipped in managed mode — the NixOS activation script sets
+    group-readable permissions (0640) on config files.
+    """
+    if is_managed():
+        return
     try:
         if os.path.exists(str(path)):
             os.chmod(path, 0o600)
@@ -413,13 +426,16 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API)
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+        },
+        "mistral": {
+            "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
         },
     },
 
@@ -720,6 +736,14 @@ OPTIONAL_ENV_VARS = {
         "description": "Custom DashScope base URL (default: coding-intl OpenAI-compat endpoint)",
         "prompt": "DashScope Base URL",
         "url": "",
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "HERMES_QWEN_BASE_URL": {
+        "description": "Qwen Portal base URL override (default: https://portal.qwen.ai/v1)",
+        "prompt": "Qwen Portal base URL (leave empty for default)",
+        "url": None,
         "password": False,
         "category": "provider",
         "advanced": True,
