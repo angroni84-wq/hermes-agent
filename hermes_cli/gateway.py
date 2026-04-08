@@ -100,12 +100,30 @@ def find_gateway_pids(exclude_pids: set | None = None) -> list:
     """
     pids = []
     _exclude = exclude_pids or set()
-    patterns = [
+    include_patterns = [
         "hermes_cli.main gateway",
         "hermes_cli/main.py gateway",
         "hermes gateway",
         "gateway/run.py",
     ]
+    exclude_patterns = [
+        "gateway status",
+        "gateway restart",
+        "gateway stop",
+        "gateway start",
+        "gateway install",
+        "gateway uninstall",
+        "gateway run --replace",
+        "gateway --help",
+    ]
+
+    def _looks_like_gateway_command(command: str) -> bool:
+        normalized = " ".join(command.split())
+        if not any(pattern in normalized for pattern in include_patterns):
+            return False
+        if any(pattern in normalized for pattern in exclude_patterns):
+            return False
+        return True
 
     try:
         if is_windows():
@@ -114,7 +132,6 @@ def find_gateway_pids(exclude_pids: set | None = None) -> list:
                 ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
                 capture_output=True, text=True, timeout=10
             )
-            # Parse WMIC LIST output: blocks of "CommandLine=...\nProcessId=...\n"
             current_cmd = ""
             for line in result.stdout.split('\n'):
                 line = line.strip()
@@ -122,7 +139,7 @@ def find_gateway_pids(exclude_pids: set | None = None) -> list:
                     current_cmd = line[len("CommandLine="):]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId="):]
-                    if any(p in current_cmd for p in patterns):
+                    if _looks_like_gateway_command(current_cmd):
                         try:
                             pid = int(pid_str)
                             if pid != os.getpid() and pid not in pids and pid not in _exclude:
@@ -132,26 +149,27 @@ def find_gateway_pids(exclude_pids: set | None = None) -> list:
                     current_cmd = ""
         else:
             result = subprocess.run(
-                ["ps", "aux"],
+                ["ps", "-axo", "pid=,command="],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             for line in result.stdout.split('\n'):
-                # Skip grep and current process
-                if 'grep' in line or str(os.getpid()) in line:
+                stripped = line.strip()
+                if not stripped:
                     continue
-                for pattern in patterns:
-                    if pattern in line:
-                        parts = line.split()
-                        if len(parts) > 1:
-                            try:
-                                pid = int(parts[1])
-                                if pid not in pids and pid not in _exclude:
-                                    pids.append(pid)
-                            except ValueError:
-                                continue
-                        break
+                try:
+                    pid_text, command = stripped.split(None, 1)
+                except ValueError:
+                    continue
+                try:
+                    pid = int(pid_text)
+                except ValueError:
+                    continue
+                if pid in {os.getpid(), os.getppid()}:
+                    continue
+                if _looks_like_gateway_command(command) and pid not in pids and pid not in _exclude:
+                    pids.append(pid)
     except Exception:
         pass
 
