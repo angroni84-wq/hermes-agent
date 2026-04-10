@@ -238,7 +238,7 @@ Skills for document creation, presentations, spreadsheets, and other productivit
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| `google-workspace` | Gmail, Calendar, Drive, Contacts, Sheets, and Docs integration via Python. Uses OAuth2 with automatic token refresh. No external binaries needed — runs entirely with Google's Python client libraries in the Hermes venv. | `productivity/google-workspace` |
+| `google-workspace` | Gmail, Calendar, Drive, Contacts, Sheets, and Docs integration via Hermes' Python OAuth helpers, with an optional `gws` CLI pattern documented for isolated multi-account setups. | `productivity/google-workspace` |
 | `linear` | Manage Linear issues, projects, and teams via the GraphQL API. Create, update, search, and organize issues. | `productivity/linear` |
 | `nano-pdf` | Edit PDFs with natural-language instructions using the nano-pdf CLI. Modify text, fix typos, update titles, and make content changes to specific pages without manual editing. | `productivity/nano-pdf` |
 | `notion` | Notion API for creating and managing pages, databases, and blocks via curl. Search, create, update, and query Notion workspaces directly from the terminal. | `productivity/notion` |

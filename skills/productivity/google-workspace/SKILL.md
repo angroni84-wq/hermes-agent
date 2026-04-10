@@ -1,7 +1,7 @@
 ---
 name: google-workspace
-description: Gmail, Calendar, Drive, Contacts, Sheets, and Docs integration via Python. Uses OAuth2 with automatic token refresh. No external binaries needed — runs entirely with Google's Python client libraries in the Hermes venv.
-version: 1.0.0
+description: Google Workspace integration for Gmail, Calendar, Drive, Contacts, Sheets, and Docs. Includes Hermes' built-in Python OAuth workflow plus an optional `gws` CLI pattern for isolated multi-account setups.
+version: 1.1.0
 author: Nous Research
 license: MIT
 required_credential_files:
@@ -18,16 +18,46 @@ metadata:
 
 # Google Workspace
 
-Gmail, Calendar, Drive, Contacts, Sheets, and Docs — all through Python scripts in this skill. No external binaries to install.
+> Status note (2026-04-10): the built-in Python scripts below remain supported. For operators who need isolated personal/work accounts or prefer Google's official CLI, this skill also documents an optional `gws` pattern using separate `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` values per account.
+
+Gmail, Calendar, Drive, Contacts, Sheets, and Docs — primarily through the Python scripts in this skill. An optional `gws` wrapper is included for multi-account CLI workflows.
 
 ## References
 
 - `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)
 
+## Optional `gws` CLI multi-account pattern
+
+Use this when one machine needs more than one Google account in the Google Workspace CLI.
+
+Do **not** mix multiple identities in one shared `gws` config dir. Keep one config root per account, for example:
+
+```bash
+# personal/default account
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$HOME/.config/gws" gws auth status
+
+# second account (work, client, sandbox, etc.)
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$HOME/.config/gws-work" gws auth status
+```
+
+This skill includes a helper wrapper:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+GWORKSPACE_SKILL_DIR="$HERMES_HOME/skills/productivity/google-workspace"
+GWS_PROFILE="$GWORKSPACE_SKILL_DIR/scripts/gws-profile.sh"
+
+$GWS_PROFILE personal auth status
+$GWS_PROFILE work auth status
+```
+
+If you prefer local convenience commands, create thin wrappers in `~/.hermes/scripts/` that export the desired `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and then `exec gws "$@"`.
+
 ## Scripts
 
-- `scripts/setup.py` — OAuth2 setup (run once to authorize)
-- `scripts/google_api.py` — API wrapper CLI (agent uses this for all operations)
+- `scripts/setup.py` — OAuth2 setup for the built-in Python backend (run once to authorize)
+- `scripts/google_api.py` — Python API wrapper CLI (agent uses this for Python-backend operations)
+- `scripts/gws-profile.sh` — optional wrapper that selects a `gws` config dir per profile
 
 ## First-Time Setup
 
@@ -136,6 +166,38 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 - Hermes now refuses to overwrite a full Google Workspace token with a narrower re-auth token missing Gmail scopes, so one profile's partial consent cannot silently break email actions later.
 - To revoke: `$GSETUP --revoke`
 
+### Optional `gws` flow for advanced / multi-account setups
+
+Use this path when you need separate accounts on one machine or want to validate live Gmail / Drive / Sheets access via the official CLI.
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+GWORKSPACE_SKILL_DIR="$HERMES_HOME/skills/productivity/google-workspace"
+GWS_PROFILE="$GWORKSPACE_SKILL_DIR/scripts/gws-profile.sh"
+```
+
+Seed a second config dir with the same OAuth client if appropriate:
+
+```bash
+mkdir -p ~/.config/gws-work
+cp ~/.config/gws/client_secret.json ~/.config/gws-work/client_secret.json
+```
+
+Authenticate the second profile with explicit scopes if the shorthand picker is awkward in automation:
+
+```bash
+$GWS_PROFILE work auth login --scopes "openid,email,profile,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/userinfo.profile,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/documents.readonly"
+```
+
+Then verify the exact profile you plan to use:
+
+```bash
+$GWS_PROFILE personal auth status
+$GWS_PROFILE work auth status
+```
+
+If OAuth succeeds but every API call fails with `Caller does not have required permission to use project ... serviceUsageConsumer`, the fix is **IAM on the OAuth client project**, not re-auth. Grant that Google account `roles/serviceusage.serviceUsageConsumer` on the GCP project that owns the OAuth client, or authenticate against a separate project/client owned by that account.
+
 ## Usage
 
 All commands go through the API script. Set `GAPI` as a shorthand:
@@ -238,7 +300,7 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 ## Rules
 
 1. **Never send email or create/delete events without confirming with the user first.** Show the draft content and ask for approval.
-2. **Check auth before first use** — run `setup.py --check`. If it fails, guide the user through setup.
+2. **Check auth before first use** — if you're using the Python backend, run `setup.py --check`; if you're using the optional CLI path, run `gws-profile.sh <profile> auth status`.
 3. **Use the Gmail search syntax reference** for complex queries — load it with `skill_view("google-workspace", file_path="references/gmail-search-syntax.md")`.
 4. **Calendar times must include timezone** — always use ISO 8601 with offset (e.g., `2026-03-01T10:00:00-06:00`) or UTC (`Z`).
 5. **Respect rate limits** — avoid rapid-fire sequential API calls. Batch reads when possible.
@@ -251,6 +313,7 @@ All commands return JSON. Parse with `jq` or read directly. Key fields:
 | `REFRESH_FAILED` | Token revoked or expired — redo Steps 3-5 |
 | `HttpError 403: Insufficient Permission` | Missing API scope — `$GSETUP --revoke` then redo Steps 3-5 |
 | `HttpError 403: Access Not Configured` | API not enabled — user needs to enable it in Google Cloud Console |
+| `Caller does not have required permission to use project ... serviceUsageConsumer` | The OAuth client project exists, but this Google account is not allowed to consume that project's APIs. Grant `roles/serviceusage.serviceUsageConsumer` on the GCP project to that account, or authenticate with a separate OAuth client/project owned by that account. |
 | `ModuleNotFoundError` | Run `$GSETUP --install-deps` |
 | Advanced Protection blocks auth | Workspace admin must allowlist the OAuth client ID |
 
