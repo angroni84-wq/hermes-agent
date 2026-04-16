@@ -751,6 +751,39 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
 
+    def test_tick_keeps_system_script_job_success_with_empty_final_response(self, tmp_path):
+        """Script-only jobs may intentionally return empty final_response.
+
+        tick() should preserve success=True for provider/model='system' jobs so
+        cron metadata reflects the actual script outcome instead of a false red.
+        """
+        from cron.scheduler import tick
+
+        job = {
+            "id": "system-script-job",
+            "name": "system-script-job",
+            "prompt": "run the local script only",
+            "provider": "system",
+            "script": "probe.py",
+            "schedule": "every 1h",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+            "last_status": None,
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.mark_job_run") as mock_mark, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "", None)):
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mock_mark.assert_called_once_with("system-script-job", True, None, delivery_error=None)
+
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
             "id": "test-job",
@@ -803,6 +836,97 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
+
+
+class TestRunJobSystemScriptOnly:
+    def test_provider_system_with_script_runs_script_without_provider_resolution(self, tmp_path):
+        job = {
+            "id": "system-script-job",
+            "name": "system script",
+            "prompt": "Script-only test",
+            "provider": "system",
+            "script": "probe.py",
+        }
+        fake_db = MagicMock()
+        scripts_dir = tmp_path / "hermes_test" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "probe.py").write_text('print("probe ok")\n', encoding="utf-8")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == ""
+        assert "## Script Output" in output
+        assert "probe ok" in output
+        assert "Script-only test" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+    def test_model_system_with_script_runs_script_without_provider_resolution(self, tmp_path):
+        job = {
+            "id": "system-model-job",
+            "name": "system model",
+            "prompt": "Script-only test",
+            "model": "system",
+            "script": "probe.py",
+        }
+        fake_db = MagicMock()
+        scripts_dir = tmp_path / "hermes_test" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "probe.py").write_text('print("probe ok")\n', encoding="utf-8")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == ""
+        assert "## Script Output" in output
+        assert "probe ok" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+    def test_provider_system_without_script_fails_fast(self, tmp_path):
+        job = {
+            "id": "broken-system-job",
+            "name": "broken system job",
+            "prompt": "Script-only test",
+            "provider": "system",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "missing required script field" in (error or "")
+        assert "## Error" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
         fake_db.close.assert_called_once()
 
 

@@ -487,6 +487,61 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _is_system_script_job(job: dict) -> bool:
+    """Return True when a cron job is marked as script-only via provider/model=system."""
+    provider = str(job.get("provider") or "").strip().lower()
+    model = str(job.get("model") or "").strip().lower()
+    return provider == "system" or model == "system"
+
+
+
+def _format_system_script_output(job: dict, *, success: bool, script_output: str) -> str:
+    """Build the saved cron output document for a script-only system job."""
+    job_name = job.get("name", job.get("id", ""))
+    prompt = str(job.get("prompt") or "")
+    schedule = job.get("schedule_display", "N/A")
+    run_time = _hermes_now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if success:
+        script_section = (
+            f"```\n{script_output}\n```"
+            if script_output
+            else "(Script ran successfully but produced no output.)"
+        )
+        return f"""# Cron Job: {job_name}
+
+**Job ID:** {job['id']}
+**Run Time:** {run_time}
+**Schedule:** {schedule}
+
+## Prompt
+
+{prompt}
+
+## Script Output
+
+{script_section}
+"""
+
+    return f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job['id']}
+**Run Time:** {run_time}
+**Schedule:** {schedule}
+
+## Prompt
+
+{prompt}
+
+## Script Error
+
+```
+{script_output}
+```
+"""
+
+
+
 def _build_job_prompt(job: dict) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first."""
     prompt = job.get("prompt", "")
@@ -597,7 +652,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     
     job_id = job["id"]
     job_name = job["name"]
-    prompt = _build_job_prompt(job)
+    prompt = str(job.get("prompt") or "")
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -627,6 +682,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             if delivery_target.get("thread_id") is not None:
                 os.environ["HERMES_CRON_AUTO_DELIVER_THREAD_ID"] = str(delivery_target["thread_id"])
 
+        if _is_system_script_job(job):
+            script_path = str(job.get("script") or "").strip()
+            if not script_path:
+                raise RuntimeError("Script-only cron job is missing required script field")
+            script_success, script_output = _run_job_script(script_path)
+            output = _format_system_script_output(job, success=script_success, script_output=script_output)
+            error_msg = None if script_success else script_output
+            if script_success:
+                logger.info("Job '%s' completed successfully via script-only path", job_name)
+                return True, output, "", None
+            logger.error("Job '%s' failed via script-only path: %s", job_name, script_output)
+            return False, output, "", error_msg
+
+        prompt = _build_job_prompt(job)
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
@@ -981,8 +1050,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 # Treat empty final_response as a soft failure so last_status
                 # is not "ok" — the agent ran but produced nothing useful.
+                # Script-only system jobs are the exception: they may do their
+                # real work entirely in the local script and intentionally
+                # return no final_response for auto-delivery.
                 # (issue #8585)
-                if success and not final_response:
+                if success and not final_response and not _is_system_script_job(job):
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
