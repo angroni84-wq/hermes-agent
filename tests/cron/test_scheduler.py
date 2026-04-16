@@ -766,6 +766,97 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
 
 
+class TestRunJobSystemScriptOnly:
+    def test_provider_system_with_script_runs_script_without_provider_resolution(self, tmp_path):
+        job = {
+            "id": "system-script-job",
+            "name": "system script",
+            "prompt": "Script-only test",
+            "provider": "system",
+            "script": "probe.py",
+        }
+        fake_db = MagicMock()
+        scripts_dir = tmp_path / "hermes_test" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "probe.py").write_text('print("probe ok")\n', encoding="utf-8")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == ""
+        assert "## Script Output" in output
+        assert "probe ok" in output
+        assert "Script-only test" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+    def test_model_system_with_script_runs_script_without_provider_resolution(self, tmp_path):
+        job = {
+            "id": "system-model-job",
+            "name": "system model",
+            "prompt": "Script-only test",
+            "model": "system",
+            "script": "probe.py",
+        }
+        fake_db = MagicMock()
+        scripts_dir = tmp_path / "hermes_test" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "probe.py").write_text('print("probe ok")\n', encoding="utf-8")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == ""
+        assert "## Script Output" in output
+        assert "probe ok" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+    def test_provider_system_without_script_fails_fast(self, tmp_path):
+        job = {
+            "id": "broken-system-job",
+            "name": "broken system job",
+            "prompt": "Script-only test",
+            "provider": "system",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "missing required script field" in (error or "")
+        assert "## Error" in output
+        runtime_mock.assert_not_called()
+        mock_agent_cls.assert_not_called()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""
 
