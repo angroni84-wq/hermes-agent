@@ -3,7 +3,7 @@
 import os
 from unittest.mock import patch
 
-from cli import HermesCLI
+from cli import HermesCLI, _get_chrome_debug_candidates
 
 
 def _assert_chrome_debug_cmd(cmd, expected_chrome, expected_port):
@@ -55,3 +55,19 @@ class TestChromeDebugLaunch:
             assert HermesCLI._try_launch_chrome_debug(9222, "Windows") is True
 
         _assert_chrome_debug_cmd(captured["cmd"], installed, 9222)
+
+
+def test_macos_candidate_order_prefers_comet_when_present():
+    candidates = _get_chrome_debug_candidates("Darwin")
+
+    assert "/Applications/Comet.app/Contents/MacOS/Comet" in candidates
+    assert "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" in candidates
+    assert candidates.index("/Applications/Comet.app/Contents/MacOS/Comet") < candidates.index(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
+
+
+def test_macos_candidate_order_prefers_chrome_when_requested():
+    candidates = _get_chrome_debug_candidates("Darwin", preferred_browser="chrome")
+
+    assert candidates[0] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"

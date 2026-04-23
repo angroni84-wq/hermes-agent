@@ -1,5 +1,6 @@
 from unittest.mock import Mock, patch
 
+import pytest
 
 HOST = "example-host"
 PORT = 9223
@@ -116,3 +117,97 @@ class TestGetCdpOverride:
 
         assert resolved == WS_URL
         mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+
+    def test_normalizes_comet_alias_from_config_to_local_cdp_websocket(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        with patch("hermes_cli.config.read_raw_config", return_value={"browser": {"cdp_url": "comet"}}), \
+             patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            resolved = browser_tool._get_cdp_override()
+
+        assert resolved == WS_URL
+        mock_get.assert_called_once_with("http://127.0.0.1:9222/json/version", timeout=10)
+
+    def test_preserves_raw_comet_target_in_session_info(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setattr(browser_tool, "_active_sessions", {})
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {})
+        monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+        monkeypatch.setattr(browser_tool, "_update_session_activity", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_get_raw_cdp_target", lambda: "comet")
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: WS_URL)
+
+        session_info = browser_tool._get_session_info("task-comet")
+
+        assert session_info["cdp_url"] == WS_URL
+        assert session_info["browser_target"] == "comet"
+
+    def test_invalid_browser_target_raises_instead_of_falling_back(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.setenv("BROWSER_CDP_URL", "banana")
+
+        with pytest.raises(ValueError, match="Unsupported browser target"):
+            browser_tool._get_cdp_override()
+
+    def test_cleanup_browser_skips_close_for_local_comet_override(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        calls = []
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_socket_safe_tmpdir", lambda: "/tmp/hermes-no-socket-dir")
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {
+                "task-comet": {
+                    "session_name": "cdp_live",
+                    "bb_session_id": None,
+                    "cdp_url": "ws://127.0.0.1:9222/devtools/browser/local-comet",
+                    "browser_target": "comet",
+                    "features": {"cdp_override": True},
+                }
+            },
+        )
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {"task-comet": 0})
+        monkeypatch.setattr(browser_tool, "_run_browser_command", lambda *args, **kwargs: calls.append(args) or {"success": True})
+
+        browser_tool.cleanup_browser("task-comet")
+
+        assert calls == []
+        assert "task-comet" not in browser_tool._active_sessions
+
+    def test_cleanup_browser_still_closes_non_comet_cdp_override(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        calls = []
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+        monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda task_id: None)
+        monkeypatch.setattr(browser_tool, "_socket_safe_tmpdir", lambda: "/tmp/hermes-no-socket-dir")
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {
+                "task-remote": {
+                    "session_name": "cdp_remote",
+                    "bb_session_id": None,
+                    "cdp_url": "ws://remote-host:9222/devtools/browser/abc",
+                    "browser_target": "chrome",
+                    "features": {"cdp_override": True},
+                }
+            },
+        )
+        monkeypatch.setattr(browser_tool, "_session_last_activity", {"task-remote": 0})
+        monkeypatch.setattr(browser_tool, "_run_browser_command", lambda *args, **kwargs: calls.append(args) or {"success": True})
+
+        browser_tool.cleanup_browser("task-remote")
+
+        assert calls and calls[0][1] == "close"

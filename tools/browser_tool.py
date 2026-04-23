@@ -65,7 +65,9 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from urllib.parse import urlparse
 from agent.auxiliary_client import call_llm
+from browser_connect import normalize_browser_connect_target
 from hermes_constants import get_hermes_home
 
 try:
@@ -259,6 +261,25 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _get_raw_cdp_target() -> str:
+    """Return the raw user/browser config target before CDP normalization."""
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception as e:
+        logger.debug("Could not read browser.cdp_url from config: %s", e)
+
+    return ""
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -270,21 +291,17 @@ def _get_cdp_override() -> str:
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
+    raw_target = _get_raw_cdp_target()
+    if not raw_target:
+        return ""
 
     try:
-        from hermes_cli.config import read_raw_config
+        normalized_target = normalize_browser_connect_target(raw_target)
+    except ValueError as exc:
+        logger.warning("Invalid browser CDP target %r: %s", raw_target, exc)
+        raise
 
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
-
-    return ""
+    return _resolve_cdp_override(normalized_target)
 
 
 # ============================================================================
@@ -605,11 +622,11 @@ def _reap_orphaned_browser_sessions():
             continue
 
         # Ownership check: prefer owner_pid file (cross-process safe).
-        owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
+        owner_pid_matches = list(Path(socket_dir).glob("*.owner_pid"))
         owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
-        if os.path.isfile(owner_pid_file):
+        if owner_pid_matches:
             try:
-                owner_pid = int(Path(owner_pid_file).read_text().strip())
+                owner_pid = int(owner_pid_matches[0].read_text().strip())
                 try:
                     os.kill(owner_pid, 0)
                     owner_alive = True
@@ -627,20 +644,21 @@ def _reap_orphaned_browser_sessions():
             continue
 
         if owner_alive is None:
-            # No owner_pid file (legacy daemon).  Fall back to in-process
-            # tracking: if this process knows about the session, leave alone.
-            if session_name in tracked_names:
+            # No owner_pid file (legacy daemon). Fall back to in-process
+            # tracking. Temp live-Comet dirs carry `session_name-command-rand`,
+            # so accept tracked session-name prefixes too.
+            if any(session_name == tracked or session_name.startswith(f"{tracked}-") for tracked in tracked_names):
                 continue
 
         # owner_alive is False (dead owner) OR legacy daemon not tracked here.
-        pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-        if not os.path.isfile(pid_file):
+        pid_matches = list(Path(socket_dir).glob("*.pid"))
+        if not pid_matches:
             # No daemon PID file — just a stale dir, remove it
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
 
         try:
-            daemon_pid = int(Path(pid_file).read_text().strip())
+            daemon_pid = int(pid_matches[0].read_text().strip())
         except (ValueError, OSError):
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
@@ -891,6 +909,165 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
+def _cdp_target_host_port(cdp_url: str) -> tuple[str, int]:
+    """Return the host/port pair implied by a CDP URL."""
+    parsed = urlparse((cdp_url or "").strip())
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    return host, port
+
+
+def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Return whether a TCP port is reachable."""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _is_local_live_cdp_session(session_info: Dict[str, Any]) -> bool:
+    """Return True when a session targets a local user-owned CDP browser."""
+    if not session_info.get("features", {}).get("cdp_override"):
+        return False
+    host, _port = _cdp_target_host_port(str(session_info.get("cdp_url") or ""))
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _detect_local_debug_browser_alias(cdp_url: str) -> Optional[str]:
+    """Best-effort detection of the local app listening on the CDP port."""
+    host, port = _cdp_target_host_port(cdp_url)
+    if sys.platform != "darwin" or host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        output = (result.stdout or "").lower()
+    except Exception:
+        return None
+
+    if "comet" in output:
+        return "comet"
+    if any(name in output for name in ["google chrome", "chrome", "chromium", "brave", "microsoft edge"]):
+        return "chrome"
+    return None
+
+
+def _is_local_comet_session(session_info: Dict[str, Any]) -> bool:
+    """Return True when a browser session targets the local visible Comet app."""
+    if not _is_local_live_cdp_session(session_info):
+        return False
+    detected_alias = _detect_local_debug_browser_alias(str(session_info.get("cdp_url") or ""))
+    if detected_alias is not None:
+        return detected_alias == "comet"
+    return str(session_info.get("browser_target") or "").strip().lower() == "comet"
+
+
+def _launch_local_comet_debug(port: int) -> bool:
+    """Launch Comet with remote debugging enabled on macOS."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.Popen(
+            [
+                "open",
+                "-a",
+                "Comet",
+                "--args",
+                f"--remote-debugging-port={port}",
+                "--restore-last-session",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        logger.debug("Could not launch local Comet with debugging enabled: %s", e)
+        return False
+
+
+def _activate_local_comet() -> bool:
+    """Bring the Comet app to the foreground on macOS."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'tell application "Comet" to activate'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.debug("Could not activate Comet: %s", e)
+        return False
+
+
+def _open_local_comet_tab() -> bool:
+    """Open a fresh visible Comet tab on macOS before navigation."""
+    if sys.platform != "darwin":
+        return False
+    script = 'tell application "Comet" to tell front window to make new tab with properties {URL:"about:blank"}'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.debug("Could not open fresh Comet tab: %s", e)
+        return False
+
+
+def _maybe_prepare_local_comet(session_info: Dict[str, Any], command: str) -> None:
+    """Prep the visible local Comet browser before an interactive command."""
+    if not _is_local_comet_session(session_info):
+        return
+
+    host, port = _cdp_target_host_port(str(session_info.get("cdp_url") or ""))
+    if not _is_port_open(host, port) and _launch_local_comet_debug(port):
+        for _ in range(10):
+            if _is_port_open(host, port):
+                break
+            time.sleep(0.5)
+
+    interactive_commands = {"open", "click", "fill", "press", "scroll"}
+    if command not in interactive_commands:
+        return
+
+    _activate_local_comet()
+    if command == "open":
+        _open_local_comet_tab()
+        time.sleep(0.2)
+
+
+def _agent_browser_cdp_url(session_info: Dict[str, Any]) -> str:
+    """Return the CDP URL agent-browser should receive for this session."""
+    cdp_url = str(session_info.get("cdp_url") or "").strip()
+    if cdp_url and _is_local_comet_session(session_info):
+        host, port = _cdp_target_host_port(cdp_url)
+        return f"http://{host}:{port}"
+    return cdp_url
+
+
 def _create_local_session(task_id: str) -> Dict[str, str]:
     import uuid
     session_name = f"h_{uuid.uuid4().hex[:10]}"
@@ -904,18 +1081,21 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     }
 
 
-def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
+def _create_cdp_session(task_id: str, cdp_url: str, browser_target: Optional[str] = None) -> Dict[str, str]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
     logger.info("Created CDP browser session %s → %s for task %s",
                 session_name, cdp_url, task_id)
-    return {
+    session_info = {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": cdp_url,
         "features": {"cdp_override": True},
     }
+    if browser_target:
+        session_info["browser_target"] = browser_target
+    return session_info
 
 
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
@@ -948,9 +1128,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
             return _active_sessions[task_id]
     
     # Create session outside the lock (network call in cloud mode)
+    raw_cdp_target = _get_raw_cdp_target()
     cdp_override = _get_cdp_override()
     if cdp_override:
-        session_info = _create_cdp_session(task_id, cdp_override)
+        browser_target = raw_cdp_target.strip().lower() if raw_cdp_target.strip().lower() in {"comet", "chrome"} else None
+        session_info = _create_cdp_session(task_id, cdp_override, browser_target=browser_target)
     else:
         provider = _get_cloud_provider()
         if provider is None:
@@ -1093,6 +1275,84 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _run_agent_browser_process(
+    cmd_parts: List[str],
+    browser_env: Dict[str, str],
+    task_socket_dir: str,
+    command_name: str,
+    timeout: int,
+) -> Dict[str, Any]:
+    """Run a raw agent-browser CLI command and return stdout/stderr metadata."""
+    stdout_path = os.path.join(task_socket_dir, f"_stdout_{command_name}")
+    stderr_path = os.path.join(task_socket_dir, f"_stderr_{command_name}")
+    stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        proc = subprocess.Popen(
+            cmd_parts,
+            stdout=stdout_fd,
+            stderr=stderr_fd,
+            stdin=subprocess.DEVNULL,
+            env=browser_env,
+        )
+    finally:
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        try:
+            proc.wait()
+        except Exception:
+            pass
+
+    with open(stdout_path, "r") as f:
+        stdout = f.read()
+    with open(stderr_path, "r") as f:
+        stderr = f.read()
+
+    for p in (stdout_path, stderr_path):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+    }
+
+
+def _agent_browser_connect_target(session_info: Dict[str, Any]) -> str:
+    """Return the target string for `agent-browser connect`."""
+    cdp_url = _agent_browser_cdp_url(session_info)
+    host, port = _cdp_target_host_port(cdp_url)
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return str(port)
+    return cdp_url
+
+
+def _cleanup_agent_browser_socket_dir(socket_dir: str) -> None:
+    """Best-effort cleanup for a specific agent-browser socket directory."""
+    if not socket_dir or not os.path.exists(socket_dir):
+        return
+
+    for pid_path in Path(socket_dir).glob("*.pid"):
+        try:
+            daemon_pid = int(pid_path.read_text().strip())
+            os.kill(daemon_pid, signal.SIGTERM)
+        except (ProcessLookupError, ValueError, PermissionError, OSError):
+            pass
+
+    shutil.rmtree(socket_dir, ignore_errors=True)
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -1142,12 +1402,17 @@ def _run_browser_command(
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.
     # Local mode: --session <name> launches a local headless Chromium.
-    # The rest of the command (--json, command, args) is identical.
+    # Local live-Comet mode bootstraps a socket-scoped `agent-browser connect`
+    # session first, then sends plain commands through that daemon.
+    local_comet_session = bool(session_info.get("cdp_url")) and _is_local_comet_session(session_info)
     if session_info.get("cdp_url"):
-        # Cloud mode — connect to remote Browserbase browser via CDP
-        # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
-        # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        _maybe_prepare_local_comet(session_info, command)
+        if local_comet_session:
+            backend_args = ["--session", session_info["session_name"]]
+        else:
+            # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
+            # --session creates a local browser instance and silently ignores --cdp.
+            backend_args = ["--cdp", _agent_browser_cdp_url(session_info)]
     else:
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
@@ -1191,49 +1456,67 @@ def _run_browser_command(
         if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
             idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
             browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
-        
-        # Use temp files for stdout/stderr instead of pipes.
-        # agent-browser starts a background daemon that inherits file
-        # descriptors.  With capture_output=True (pipes), the daemon keeps
-        # the pipe fds open after the CLI exits, so communicate() never
-        # sees EOF and blocks until the timeout fires.
-        stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
-        stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            proc = subprocess.Popen(
-                cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
-                env=browser_env,
-            )
-        finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
 
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        if local_comet_session and not session_info.get("agent_browser_connected"):
+            connect_cmd = cmd_prefix + ["connect", _agent_browser_connect_target(session_info)]
+            connect_result = _run_agent_browser_process(
+                connect_cmd,
+                browser_env,
+                task_socket_dir,
+                f"connect_{session_info['session_name']}",
+                timeout=8,
+            )
+            if connect_result["stderr"] and connect_result["stderr"].strip():
+                logger.debug("browser 'connect' stderr: %s", connect_result["stderr"].strip()[:500])
+
+            ready = False
+            ready_cmd = cmd_prefix + ["get", "url", "--json"]
+            for _attempt in range(15):
+                ready_result = _run_agent_browser_process(
+                    ready_cmd,
+                    browser_env,
+                    task_socket_dir,
+                    f"ready_{session_info['session_name']}",
+                    timeout=3,
+                )
+                if ready_result["returncode"] == 0 and not ready_result["timed_out"] and ready_result["stdout"].strip():
+                    ready = True
+                    break
+                time.sleep(2)
+
+            if not ready:
+                logger.warning(
+                    "browser 'connect' failed to become ready rc=%s stdout=%s stderr=%s",
+                    connect_result["returncode"],
+                    connect_result["stdout"].strip()[:500],
+                    connect_result["stderr"].strip()[:500],
+                )
+                return {"success": False, "error": "Failed to connect agent-browser to live Comet session"}
+
+            session_info["agent_browser_connected"] = True
+
+        if local_comet_session and command == "snapshot":
+            last_action_ts = float(session_info.get("_local_comet_last_action_ts") or 0)
+            elapsed = time.time() - last_action_ts if last_action_ts else None
+            settle_delay = 5.0
+            if elapsed is not None and elapsed < settle_delay:
+                time.sleep(settle_delay - elapsed)
+
+        process_result = _run_agent_browser_process(
+            cmd_parts,
+            browser_env,
+            task_socket_dir,
+            command,
+            timeout=timeout,
+        )
+        if process_result["timed_out"]:
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
             return {"success": False, "error": f"Command timed out after {timeout} seconds"}
 
-        with open(stdout_path, "r") as f:
-            stdout = f.read()
-        with open(stderr_path, "r") as f:
-            stderr = f.read()
-        returncode = proc.returncode
-
-        # Clean up temp files (best-effort)
-        for p in (stdout_path, stderr_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        stdout = process_result["stdout"]
+        stderr = process_result["stderr"]
+        returncode = process_result["returncode"]
 
         # Log stderr for diagnostics — use warning level on failure so it's visible
         if stderr and stderr.strip():
@@ -1259,6 +1542,8 @@ def _run_browser_command(
                         logger.warning("snapshot returned empty content. "
                                        "Possible stale daemon or CDP connection issue. "
                                        "returncode=%s", returncode)
+                if local_comet_session and parsed.get("success") and command in {"open", "click", "fill", "press", "scroll"}:
+                    session_info["_local_comet_last_action_ts"] = time.time()
                 return parsed
             except json.JSONDecodeError:
                 raw = stdout_text[:2000]
@@ -2276,12 +2561,14 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
         
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # Try to close via agent-browser first (needs session in _active_sessions).
+        # For the visible local Comet path, do not blindly close the user's real browser tab.
+        if not _is_local_comet_session(session_info):
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug("agent-browser close command completed for task %s", task_id)
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
         
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -2297,21 +2584,13 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                 except Exception as e:
                     logger.warning("Could not close cloud browser session: %s", e)
         
-        # Kill the daemon process and clean up socket directory
+        # Kill daemon processes and clean up socket directories
         session_name = session_info.get("session_name", "")
-        if session_name:
-            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
-            if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
-                    try:
-                        daemon_pid = int(Path(pid_file).read_text().strip())
-                        os.kill(daemon_pid, signal.SIGTERM)
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
-                shutil.rmtree(socket_dir, ignore_errors=True)
+        socket_dirs = list(session_info.get("socket_dirs") or [])
+        if not socket_dirs and session_name:
+            socket_dirs = [os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")]
+        for socket_dir in socket_dirs:
+            _cleanup_agent_browser_socket_dir(socket_dir)
         
         logger.debug("Removed task %s from active sessions", task_id)
     else:

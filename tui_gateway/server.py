@@ -3657,12 +3657,14 @@ def _(rid, params: dict) -> dict:
         url = os.environ.get("BROWSER_CDP_URL", "")
         return _ok(rid, {"connected": bool(url), "url": url})
     if action == "connect":
-        url = params.get("url", "http://localhost:9222")
+        raw_url = params.get("url", "comet")
         try:
             import urllib.request
             from urllib.parse import urlparse
+            from browser_connect import normalize_browser_connect_target
             from tools.browser_tool import cleanup_all_browsers
 
+            url = normalize_browser_connect_target(raw_url)
             parsed = urlparse(url if "://" in url else f"http://{url}")
             if parsed.scheme not in {"http", "https", "ws", "wss"}:
                 return _err(rid, 4015, f"unsupported browser url: {url}")
@@ -3683,7 +3685,7 @@ def _(rid, params: dict) -> dict:
             if not ok:
                 return _err(rid, 5031, f"could not reach browser CDP at {url}")
 
-            os.environ["BROWSER_CDP_URL"] = url
+            os.environ["BROWSER_CDP_URL"] = raw_url
             cleanup_all_browsers()
         except Exception as e:
             return _err(rid, 5031, str(e))
